@@ -1,0 +1,71 @@
+services:
+  bot:
+    build: .
+    command: python -m bot
+    volumes:
+      - .:/app
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://user:password@postgres:5432/love_restaurant
+      - REDIS_URL=redis://redis:6379/0
+      - BOT_TOKEN=${BOT_TOKEN}
+      - ADMIN_ID=${ADMIN_ID}
+      - ADMIN_USERNAME=${ADMIN_USERNAME}
+    restart: unless-stopped
+
+  migrations:
+    build: .
+    command: >
+      sh -c "
+        echo 'Waiting for PostgreSQL to be ready...' &&
+        sleep 5 &&
+        echo 'Starting database migrations...' &&
+        python -m alembic upgrade head --sql > migration_sql.txt &&
+        echo 'Generated SQL:' &&
+        cat migration_sql.txt &&
+        echo 'Applying migrations...' &&
+        python -m alembic upgrade head &&
+        echo 'Migration successful!'
+      "
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://user:password@postgres:5432/love_restaurant
+      - PYTHONUNBUFFERED=1
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: love_restaurant
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d love_restaurant"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data: 

@@ -1,0 +1,183 @@
+BEGIN;
+
+CREATE TABLE alembic_version (
+    version_num VARCHAR(32) NOT NULL, 
+    CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)
+);
+
+-- Running upgrade  -> initial_migration
+
+CREATE TABLE users (
+    id SERIAL NOT NULL, 
+    telegram_id INTEGER NOT NULL, 
+    is_restaurant_owner BOOLEAN NOT NULL, 
+    current_restaurant_id INTEGER, 
+    PRIMARY KEY (id), 
+    UNIQUE (telegram_id)
+);
+
+CREATE TABLE restaurants (
+    id SERIAL NOT NULL, 
+    name VARCHAR(100) NOT NULL, 
+    owner_id INTEGER NOT NULL, 
+    invite_code VARCHAR(10) NOT NULL, 
+    PRIMARY KEY (id), 
+    FOREIGN KEY(owner_id) REFERENCES users (id), 
+    UNIQUE (invite_code), 
+    UNIQUE (owner_id)
+);
+
+CREATE TABLE menu_items (
+    id SERIAL NOT NULL, 
+    restaurant_id INTEGER NOT NULL, 
+    name VARCHAR(20) NOT NULL, 
+    photo VARCHAR, 
+    description TEXT, 
+    duration INTEGER NOT NULL, 
+    price_kisses INTEGER, 
+    price_hugs INTEGER, 
+    PRIMARY KEY (id), 
+    FOREIGN KEY(restaurant_id) REFERENCES restaurants (id)
+);
+
+ALTER TABLE users ADD CONSTRAINT fk_users_current_restaurant FOREIGN KEY(current_restaurant_id) REFERENCES restaurants (id);
+
+INSERT INTO alembic_version (version_num) VALUES ('initial_migration') RETURNING alembic_version.version_num;
+
+-- Running upgrade initial_migration -> add_donations
+
+ALTER TABLE users ADD COLUMN created_at TIMESTAMP WITHOUT TIME ZONE;
+
+ALTER TABLE users ADD COLUMN last_activity TIMESTAMP WITHOUT TIME ZONE;
+
+ALTER TABLE restaurants ADD COLUMN created_at TIMESTAMP WITHOUT TIME ZONE;
+
+ALTER TABLE menu_items ADD COLUMN created_at TIMESTAMP WITHOUT TIME ZONE;
+
+CREATE TABLE donations (
+    id SERIAL NOT NULL, 
+    user_id INTEGER NOT NULL, 
+    amount INTEGER NOT NULL, 
+    comment TEXT, 
+    created_at TIMESTAMP WITHOUT TIME ZONE, 
+    PRIMARY KEY (id), 
+    FOREIGN KEY(user_id) REFERENCES users (id)
+);
+
+UPDATE alembic_version SET version_num='add_donations' WHERE alembic_version.version_num = 'initial_migration';
+
+-- Running upgrade add_donations -> bigint_telegram_id
+
+ALTER TABLE users ALTER COLUMN telegram_id TYPE BIGINT;
+
+UPDATE alembic_version SET version_num='bigint_telegram_id' WHERE alembic_version.version_num = 'add_donations';
+
+-- Running upgrade bigint_telegram_id -> 3a8f2b54a9c1
+
+CREATE TABLE orders (
+    id SERIAL NOT NULL, 
+    user_id INTEGER, 
+    restaurant_id INTEGER, 
+    status VARCHAR(20) DEFAULT 'pending', 
+    total_kisses INTEGER DEFAULT '0', 
+    total_hugs INTEGER DEFAULT '0', 
+    total_duration INTEGER DEFAULT '0', 
+    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP, 
+    completed_at TIMESTAMP WITHOUT TIME ZONE, 
+    PRIMARY KEY (id), 
+    FOREIGN KEY(restaurant_id) REFERENCES restaurants (id), 
+    FOREIGN KEY(user_id) REFERENCES users (id)
+);
+
+CREATE TABLE order_items (
+    id SERIAL NOT NULL, 
+    order_id INTEGER, 
+    menu_item_id INTEGER, 
+    quantity INTEGER DEFAULT '1', 
+    price_kisses INTEGER DEFAULT '0', 
+    price_hugs INTEGER DEFAULT '0', 
+    PRIMARY KEY (id), 
+    FOREIGN KEY(menu_item_id) REFERENCES menu_items (id), 
+    FOREIGN KEY(order_id) REFERENCES orders (id) ON DELETE CASCADE
+);
+
+CREATE INDEX ix_orders_user_id ON orders (user_id);
+
+CREATE INDEX ix_orders_restaurant_id ON orders (restaurant_id);
+
+CREATE INDEX ix_orders_status ON orders (status);
+
+CREATE INDEX ix_orders_created_at ON orders (created_at);
+
+CREATE INDEX ix_order_items_order_id ON order_items (order_id);
+
+CREATE INDEX ix_order_items_menu_item_id ON order_items (menu_item_id);
+
+UPDATE alembic_version SET version_num='3a8f2b54a9c1' WHERE alembic_version.version_num = 'bigint_telegram_id';
+
+-- Running upgrade 3a8f2b54a9c1 -> 70c2d98dba91
+
+CREATE TABLE broadcasts (
+    id SERIAL NOT NULL, 
+    name VARCHAR(100) NOT NULL, 
+    text TEXT NOT NULL, 
+    photo VARCHAR, 
+    button_text VARCHAR(100), 
+    button_url VARCHAR(255), 
+    created_at TIMESTAMP WITHOUT TIME ZONE, 
+    scheduled_at TIMESTAMP WITHOUT TIME ZONE, 
+    sent_at TIMESTAMP WITHOUT TIME ZONE, 
+    status VARCHAR(20), 
+    total_users INTEGER, 
+    received_count INTEGER, 
+    button_clicks INTEGER, 
+    PRIMARY KEY (id)
+);
+
+CREATE TABLE broadcast_recipients (
+    id SERIAL NOT NULL, 
+    broadcast_id INTEGER, 
+    user_id INTEGER, 
+    received BOOLEAN, 
+    clicked BOOLEAN, 
+    received_at TIMESTAMP WITHOUT TIME ZONE, 
+    clicked_at TIMESTAMP WITHOUT TIME ZONE, 
+    PRIMARY KEY (id), 
+    FOREIGN KEY(broadcast_id) REFERENCES broadcasts (id), 
+    FOREIGN KEY(user_id) REFERENCES users (id)
+);
+
+ALTER TABLE donations ALTER COLUMN user_id DROP NOT NULL;
+
+ALTER TABLE menu_items ALTER COLUMN restaurant_id DROP NOT NULL;
+
+ALTER TABLE menu_items ALTER COLUMN duration DROP NOT NULL;
+
+DROP INDEX ix_order_items_menu_item_id;
+
+DROP INDEX ix_order_items_order_id;
+
+ALTER TABLE order_items DROP CONSTRAINT order_items_order_id_fkey;
+
+ALTER TABLE order_items ADD FOREIGN KEY(order_id) REFERENCES orders (id);
+
+DROP INDEX ix_orders_created_at;
+
+DROP INDEX ix_orders_restaurant_id;
+
+DROP INDEX ix_orders_status;
+
+DROP INDEX ix_orders_user_id;
+
+ALTER TABLE restaurants ALTER COLUMN owner_id DROP NOT NULL;
+
+ALTER TABLE restaurants ALTER COLUMN invite_code DROP NOT NULL;
+
+ALTER TABLE users ALTER COLUMN telegram_id DROP NOT NULL;
+
+ALTER TABLE users ALTER COLUMN is_restaurant_owner DROP NOT NULL;
+
+UPDATE alembic_version SET version_num='70c2d98dba91' WHERE alembic_version.version_num = '3a8f2b54a9c1';
+
+COMMIT;
+

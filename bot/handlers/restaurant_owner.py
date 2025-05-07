@@ -1,0 +1,1441 @@
+import random
+import string
+import logging
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from sqlalchemy import select, func, and_
+from ..states.states import RestaurantCreation, MenuItemForm, EditMenuItem, RestaurantSettings
+from ..models.base import async_session
+from ..models.models import User, Restaurant, MenuItem
+from ..keyboards.inline import get_payment_type_kb
+from ..keyboards.reply import get_main_menu
+from datetime import datetime
+
+router = Router()
+
+def generate_invite_code(length=6):
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
+
+async def generate_unique_invite_code(session, length=8):
+    """Генерирует уникальный код приглашения и проверяет его на уникальность в базе данных"""
+    max_attempts = 5  # Максимальное количество попыток
+    
+    for _ in range(max_attempts):
+        # Генерируем код
+        invite_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
+        
+        # Проверяем, существует ли ресторан с таким кодом
+        result = await session.execute(
+            select(Restaurant).where(Restaurant.invite_code == invite_code)
+        )
+        existing_restaurant = result.scalar_one_or_none()
+        
+        # Если ресторана с таким кодом нет, возвращаем код
+        if not existing_restaurant:
+            return invite_code
+    
+    # Если после нескольких попыток не удалось создать уникальный код,
+    # увеличиваем длину кода и пробуем снова
+    return await generate_unique_invite_code(session, length + 1)
+
+def get_restaurant_admin_kb():
+    kb = [
+        [
+            InlineKeyboardButton(text="📝 Добавить позицию", callback_data="add_item"),
+            InlineKeyboardButton(text="🛠 Управление меню", callback_data="manage_menu")
+        ],
+        [
+            InlineKeyboardButton(text="👥 Управление клиентами", callback_data="manage_clients"),
+            InlineKeyboardButton(text="⚙️ Настройки ресторана", callback_data="restaurant_settings")
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+async def manage_menu_command(message: Message, state: FSMContext):
+    """Вспомогательная функция для возврата к управлению меню после редактирования"""
+    await state.clear()
+    
+    async with async_session() as session:
+        # Получаем пользователя
+        result = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
+        user = result.scalar_one_or_none()
+        
+        if not user or not user.is_restaurant_owner:
+            await message.answer("У вас нет ресторана!")
+            return
+        
+        # Получаем ресторан пользователя
+        result = await session.execute(select(Restaurant).where(Restaurant.owner_id == user.id))
+        restaurant = result.scalar_one_or_none()
+        
+        if not restaurant:
+            await message.answer("Ресторан не найден. Попробуйте создать новый.")
+            return
+        
+        # Получаем меню ресторана
+        result = await session.execute(select(MenuItem).where(MenuItem.restaurant_id == restaurant.id))
+        menu_items = result.scalars().all()
+        
+        if not menu_items:
+            kb = [[InlineKeyboardButton(text="📝 Добавить позицию", callback_data="add_item")]]
+            await message.answer(
+                "В вашем меню пока нет позиций!",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+            )
+            return
+        
+        # Создаем клавиатуру с позициями в два столбца
+        kb = []
+        
+        # Группируем по 2 кнопки в ряд (редактирование и удаление в одном ряду)
+        for item in menu_items:
+            row = [
+                InlineKeyboardButton(
+                    text=f"✏️ {item.name}",
+                    callback_data=f"edit_menu_item:{item.id}"
+                ),
+                InlineKeyboardButton(
+                    text=f"🗑️ {item.name}",
+                    callback_data=f"delete_item:{item.id}"
+                )
+            ]
+            kb.append(row)
+        
+        kb.append([InlineKeyboardButton(text="📝 Добавить позицию", callback_data="add_item")])
+        kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_restaurant")])
+        
+        await message.answer(
+            "Управление меню:\nНажмите на позицию для редактирования или удаления:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+        )
+
+@router.message(F.text == "🍴 Создать ресторан")
+async def create_restaurant_start(message: Message, state: FSMContext):
+    await handle_restaurant_button(message, state)
+
+@router.message(F.text == "🍴 Мой ресторан")
+async def my_restaurant(message: Message, state: FSMContext):
+    await handle_restaurant_button(message, state)
+
+async def handle_restaurant_button(message: Message, state: FSMContext):
+    """Общая функция для обработки кнопок создания и управления рестораном"""
+    async with async_session() as session:
+        result = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
+        user = result.scalar_one_or_none()
+        
+        if not user:
+            # Если пользователя нет в БД, создаем его
+            user = User(telegram_id=message.from_user.id)
+            session.add(user)
+            await session.commit()
+            
+            # Сразу же переходим к созданию ресторана
+            await state.set_state(RestaurantCreation.waiting_for_name)
+            await message.answer("Добро пожаловать! Введите название вашего ресторана:")
+            return
+        
+        # Проверяем, есть ли у пользователя ресторан
+        try:
+            # Отдельным запросом проверяем наличие ресторана
+            result = await session.execute(
+                select(Restaurant).where(Restaurant.owner_id == user.id)
+            )
+            restaurant = result.scalar_one_or_none()
+            
+            if restaurant:
+                # Если ресторан есть, показываем меню управления
+                await message.answer(
+                    f"🍴 Ваш ресторан: {restaurant.name}\n\n"
+                    f"🔑 Код приглашения: {restaurant.invite_code}\n"
+                    f"🔗 Ссылка для приглашения: t.me/{(await message.bot.me()).username}?start={restaurant.invite_code}\n\n"
+                    f"Выберите действие:",
+                    reply_markup=get_restaurant_admin_kb()
+                )
+                return
+        except Exception as e:
+            # Логируем ошибку и продолжаем
+            print(f"Ошибка при проверке ресторана: {e}")
+    
+    # Если ресторана нет или произошла ошибка при проверке, создаем новый
+    await state.set_state(RestaurantCreation.waiting_for_name)
+    await message.answer("Введите название вашего ресторана:")
+
+@router.message(RestaurantCreation.waiting_for_name)
+async def process_restaurant_name(message: Message, state: FSMContext):
+    async with async_session() as session:
+        result = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
+        user = result.scalar_one_or_none()
+        
+        # Create restaurant
+        invite_code = await generate_unique_invite_code(session)
+        restaurant = Restaurant(
+            name=message.text,
+            owner_id=user.id,
+            invite_code=invite_code
+        )
+        session.add(restaurant)
+        
+        # Update user
+        user.is_restaurant_owner = True
+        await session.commit()
+    
+    await state.clear()
+    
+    # First send the success message with inline keyboard
+    await message.answer(
+        f"🎉 Ваш ресторан '{message.text}' успешно создан!\n\n"
+        f"🔑 Код приглашения: {invite_code}\n"
+        f"🔗 Ссылка для приглашения: t.me/{(await message.bot.me()).username}?start={invite_code}\n\n"
+        f"Управление рестораном:",
+        reply_markup=get_restaurant_admin_kb()
+    )
+    
+    # Then update the main keyboard to show "My Restaurant" instead of "Create Restaurant"
+    await message.answer(
+        "Основное меню обновлено!",
+        reply_markup=get_main_menu(user)
+    )
+
+@router.callback_query(F.data == "add_item")
+async def add_menu_item_start(callback: CallbackQuery, state: FSMContext):
+    # Просто отвечаем на callback, чтобы убрать "часики"
+    await callback.answer()
+    
+    # Переходим к состоянию ожидания имени
+    await state.set_state(MenuItemForm.name)
+    
+    # Отправляем сообщение с запросом названия
+    await callback.message.answer("Введите название позиции (до 20 символов):")
+
+@router.message(MenuItemForm.name)
+async def process_menu_item_name(message: Message, state: FSMContext):
+    """Обработка ввода названия позиции"""
+    name = message.text.strip()
+    
+    if not name:
+        await message.answer(
+            "Название не может быть пустым. Пожалуйста, введите корректное название:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+            ])
+        )
+        return
+    
+    if len(name) > 20:
+        await message.answer(
+            "Название слишком длинное. Пожалуйста, введите название до 20 символов:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+            ])
+        )
+        return
+    
+    # Сохраняем название в состоянии
+    await state.update_data(name=name)
+    
+    # Переходим к следующему шагу - загрузке фото
+    await state.set_state(MenuItemForm.photo)
+    await message.answer(
+        "Отправьте фото позиции или нажмите кнопку ниже, чтобы пропустить этот шаг:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Пропустить", callback_data="skip_photo")],
+            [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+        ])
+    )
+
+@router.message(MenuItemForm.photo)
+async def process_menu_item_photo(message: Message, state: FSMContext):
+    """Обработка загрузки фото для позиции меню"""
+    if not message.photo:
+        await message.answer(
+            "Пожалуйста, отправьте фото или нажмите кнопку 'Пропустить':",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➡️ Пропустить", callback_data="skip_photo")],
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+            ])
+        )
+        return
+    
+    # Получаем file_id фото (берем самое большое из массива)
+    photo_id = message.photo[-1].file_id
+    
+    # Сохраняем file_id фото в состоянии
+    await state.update_data(photo_id=photo_id)
+    
+    # Переходим к следующему шагу - вводу описания
+    await state.set_state(MenuItemForm.description)
+    await message.answer(
+        "Отправьте описание позиции или нажмите кнопку ниже, чтобы пропустить этот шаг:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Пропустить", callback_data="skip_description")],
+            [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+        ])
+    )
+
+@router.callback_query(F.data == "skip_photo")
+async def skip_photo(callback: CallbackQuery, state: FSMContext):
+    """Обработка пропуска загрузки фото"""
+    await callback.answer()
+    
+    # Переходим к следующему шагу - вводу описания
+    await state.set_state(MenuItemForm.description)
+    await callback.message.answer(
+        "Отправьте описание позиции или нажмите кнопку ниже, чтобы пропустить этот шаг:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Пропустить", callback_data="skip_description")],
+            [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+        ])
+    )
+
+@router.message(MenuItemForm.description)
+async def process_menu_item_description(message: Message, state: FSMContext):
+    """Обработка ввода описания позиции"""
+    description = message.text.strip()
+    
+    # Сохраняем описание в состоянии
+    await state.update_data(description=description)
+    
+    # Переходим к следующему шагу - вводу длительности
+    await state.set_state(MenuItemForm.duration)
+    await message.answer(
+        "Укажите продолжительность в минутах (только число):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+        ])
+    )
+
+@router.callback_query(F.data == "skip_description")
+async def skip_description(callback: CallbackQuery, state: FSMContext):
+    """Обработка пропуска ввода описания"""
+    await callback.answer()
+    
+    # Переходим к следующему шагу - вводу длительности
+    await state.set_state(MenuItemForm.duration)
+    await callback.message.answer(
+        "Укажите продолжительность в минутах (только число):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+        ])
+    )
+
+@router.callback_query(F.data == "manage_menu")
+async def manage_menu(callback: CallbackQuery):
+    # Просто отвечаем на callback, чтобы убрать "часики"
+    await callback.answer()
+    
+    async with async_session() as session:
+        # Получаем пользователя
+        result = await session.execute(select(User).where(User.telegram_id == callback.from_user.id))
+        user = result.scalar_one_or_none()
+        
+        if not user or not user.is_restaurant_owner:
+            await callback.message.answer("У вас нет ресторана!")
+            return
+        
+        # Получаем ресторан пользователя
+        result = await session.execute(select(Restaurant).where(Restaurant.owner_id == user.id))
+        restaurant = result.scalar_one_or_none()
+        
+        if not restaurant:
+            await callback.message.answer("Ресторан не найден. Попробуйте создать новый.")
+            return
+        
+        # Получаем меню ресторана
+        result = await session.execute(select(MenuItem).where(MenuItem.restaurant_id == restaurant.id))
+        menu_items = result.scalars().all()
+        
+        if not menu_items:
+            kb = [[InlineKeyboardButton(text="📝 Добавить позицию", callback_data="add_item")]]
+            await callback.message.answer(
+                "В вашем меню пока нет позиций!",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+            )
+            return
+        
+        # Создаем клавиатуру с позициями в два столбца
+        kb = []
+        
+        # Группируем по 2 кнопки в ряд (редактирование и удаление в одном ряду)
+        for item in menu_items:
+            row = [
+                InlineKeyboardButton(
+                    text=f"✏️ {item.name}",
+                    callback_data=f"edit_menu_item:{item.id}"
+                ),
+                InlineKeyboardButton(
+                    text=f"🗑️ {item.name}",
+                    callback_data=f"delete_item:{item.id}"
+                )
+            ]
+            kb.append(row)
+        
+        kb.append([InlineKeyboardButton(text="📝 Добавить позицию", callback_data="add_item")])
+        kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_restaurant")])
+        
+        await callback.message.answer(
+            "Управление меню:\nНажмите на позицию для редактирования или удаления:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+        )
+
+@router.callback_query(F.data == "back_to_restaurant")
+async def back_to_restaurant(callback: CallbackQuery):
+    # Просто отвечаем на callback, чтобы убрать "часики"
+    await callback.answer()
+    
+    async with async_session() as session:
+        # Получаем пользователя
+        result = await session.execute(select(User).where(User.telegram_id == callback.from_user.id))
+        user = result.scalar_one_or_none()
+        
+        if not user or not user.is_restaurant_owner:
+            await callback.message.answer("У вас нет ресторана!")
+            return
+        
+        # Получаем ресторан пользователя
+        result = await session.execute(select(Restaurant).where(Restaurant.owner_id == user.id))
+        restaurant = result.scalar_one_or_none()
+        
+        if not restaurant:
+            await callback.message.answer("Ресторан не найден. Попробуйте создать новый.")
+            return
+        
+        await callback.message.edit_text(
+            f"🍴 Ваш ресторан: {restaurant.name}\n\n"
+            f"🔑 Код приглашения: {restaurant.invite_code}\n"
+            f"🔗 Ссылка для приглашения: t.me/{(await callback.bot.me()).username}?start={restaurant.invite_code}\n\n"
+            f"Выберите действие:",
+            reply_markup=get_restaurant_admin_kb()
+        )
+
+@router.callback_query(F.data.startswith("edit_menu_item:"))
+async def edit_menu_item(callback: CallbackQuery, state: FSMContext):
+    """Редактирование позиции меню"""
+    item_id = int(callback.data.split(":")[-1])
+    
+    async with async_session() as session:
+        # Получаем позицию по ID
+        result = await session.execute(select(MenuItem).where(MenuItem.id == item_id))
+        item = result.scalar_one_or_none()
+        
+        if not item:
+            await callback.answer("Позиция не найдена")
+            return
+        
+        # Сохраняем ID позиции в состоянии
+        await state.update_data(edit_item_id=item_id)
+        
+        # Создаем клавиатуру для выбора, что редактировать
+        kb = [
+            [InlineKeyboardButton(text="📝 Название", callback_data=f"edit_field:name:{item_id}")],
+            [InlineKeyboardButton(text="📷 Фото", callback_data=f"edit_field:photo:{item_id}")],
+            [InlineKeyboardButton(text="📋 Описание", callback_data=f"edit_field:description:{item_id}")],
+            [InlineKeyboardButton(text="⏱ Длительность", callback_data=f"edit_field:duration:{item_id}")],
+            [InlineKeyboardButton(text="💰 Стоимость", callback_data=f"edit_field:price:{item_id}")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_menu")]
+        ]
+        
+        await callback.message.edit_text(
+            f"Редактирование позиции: {item.name}\n\n"
+            f"Выберите, что вы хотите изменить:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+        )
+        await callback.answer()
+
+@router.callback_query(F.data.startswith("edit_field:"))
+async def edit_specific_field(callback: CallbackQuery, state: FSMContext):
+    """Редактирование конкретного поля позиции меню"""
+    parts = callback.data.split(":")
+    field = parts[1]
+    item_id = int(parts[2])
+    
+    async with async_session() as session:
+        # Получаем позицию по ID
+        result = await session.execute(select(MenuItem).where(MenuItem.id == item_id))
+        item = result.scalar_one_or_none()
+        
+        if not item:
+            await callback.answer("Позиция не найдена")
+            return
+    
+    # Сохраняем информацию о редактируемом поле
+    await state.update_data(edit_field=field, edit_item_id=item_id)
+    
+    if field == "name":
+        await state.set_state(EditMenuItem.waiting_for_name)
+        await callback.message.edit_text(f"Текущее название: {item.name}\n\nВведите новое название:")
+    
+    elif field == "photo":
+        await state.set_state(EditMenuItem.waiting_for_photo)
+        photo_text = "Текущее фото: есть" if item.photo else "Текущее фото: отсутствует"
+        await callback.message.edit_text(
+            f"{photo_text}\n\n"
+            f"Отправьте новое фото или нажмите кнопку ниже, чтобы удалить фото:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Удалить фото", callback_data=f"remove_photo:{item_id}")],
+                [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"edit_menu_item:{item_id}")]
+            ])
+        )
+    
+    elif field == "description":
+        await state.set_state(EditMenuItem.waiting_for_description)
+        await callback.message.edit_text(
+            f"Текущее описание: {item.description or 'отсутствует'}\n\n"
+            f"Введите новое описание:"
+        )
+    
+    elif field == "duration":
+        await state.set_state(EditMenuItem.waiting_for_duration)
+        await callback.message.edit_text(
+            f"Текущая длительность: {item.duration} мин\n\n"
+            f"Укажите продолжительность в минутах (только число):"
+        )
+    
+    elif field == "price":
+        # Для цены сначала выбираем тип оплаты
+        await state.set_state(EditMenuItem.waiting_for_payment_type)
+        await callback.message.edit_text(
+            f"Текущая стоимость:\n"
+            f"💋 Поцелуйчики: {item.price_kisses or 'не указано'}\n"
+            f"🤗 Обнимашки: {item.price_hugs or 'не указано'} мин\n\n"
+            f"Выберите тип оплаты:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="💋 Поцелуйчики", callback_data="edit_payment_type:kisses"),
+                    InlineKeyboardButton(text="🤗 Обнимашки", callback_data="edit_payment_type:hugs")
+                ],
+                [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"edit_menu_item:{item_id}")]
+            ])
+        )
+    
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("remove_photo:"))
+async def remove_photo(callback: CallbackQuery, state: FSMContext):
+    """Удаление фото у позиции"""
+    item_id = int(callback.data.split(":")[-1])
+    
+    async with async_session() as session:
+        # Получаем позицию по ID
+        result = await session.execute(select(MenuItem).where(MenuItem.id == item_id))
+        item = result.scalar_one_or_none()
+        
+        if not item:
+            await callback.answer("Позиция не найдена")
+            return
+        
+        # Удаляем фото
+        item.photo = None
+        await session.commit()
+        
+        await callback.answer("Фото удалено")
+        await edit_menu_item(callback, state)  # Возвращаемся к редактированию
+
+@router.callback_query(F.data.startswith("edit_payment_type:"))
+async def edit_payment_type(callback: CallbackQuery, state: FSMContext):
+    """Выбор типа оплаты при редактировании цены"""
+    payment_type = callback.data.split(":")[-1]
+    await state.update_data(edit_payment_type=payment_type)
+    
+    if payment_type == "kisses":
+        await state.set_state(EditMenuItem.waiting_for_price_kisses)
+        await callback.message.edit_text("Введите количество поцелуйчиков (только число):")
+    else:
+        await state.set_state(EditMenuItem.waiting_for_price_hugs)
+        await callback.message.edit_text("Введите количество минут обнимашек (только число):")
+    
+    await callback.answer()
+
+@router.message(EditMenuItem.waiting_for_name)
+async def process_edit_name(message: Message, state: FSMContext):
+    """Обработка ввода нового названия"""
+    new_name = message.text
+    data = await state.get_data()
+    item_id = data.get("edit_item_id")
+    
+    if not new_name:
+        await message.answer("Название не может быть пустым. Введите название:")
+        return
+    
+    async with async_session() as session:
+        # Получаем позицию по ID
+        result = await session.execute(select(MenuItem).where(MenuItem.id == item_id))
+        item = result.scalar_one_or_none()
+        
+        if not item:
+            await message.answer("Позиция не найдена")
+            await state.clear()
+            return
+        
+        # Обновляем название
+        item.name = new_name
+        await session.commit()
+        
+        await message.answer(f"✅ Название успешно изменено на '{new_name}'")
+        
+        # Возвращаемся к управлению меню
+        await manage_menu_command(message, state)
+
+@router.message(EditMenuItem.waiting_for_description)
+async def process_edit_description(message: Message, state: FSMContext):
+    """Обработка ввода нового описания"""
+    new_description = message.text
+    data = await state.get_data()
+    item_id = data.get("edit_item_id")
+    
+    async with async_session() as session:
+        # Получаем позицию по ID
+        result = await session.execute(select(MenuItem).where(MenuItem.id == item_id))
+        item = result.scalar_one_or_none()
+        
+        if not item:
+            await message.answer("Позиция не найдена")
+            await state.clear()
+            return
+        
+        # Обновляем описание
+        item.description = new_description
+        await session.commit()
+        
+        await message.answer(f"✅ Описание успешно изменено")
+        
+        # Возвращаемся к управлению меню
+        await manage_menu_command(message, state)
+
+@router.message(EditMenuItem.waiting_for_photo)
+async def process_edit_photo(message: Message, state: FSMContext):
+    """Обработка загрузки нового фото"""
+    data = await state.get_data()
+    item_id = data.get("edit_item_id")
+    
+    if not message.photo:
+        await message.answer("Пожалуйста, отправьте фотографию.")
+        return
+    
+    # Получаем ID фото
+    photo_id = message.photo[-1].file_id
+    
+    async with async_session() as session:
+        # Получаем позицию по ID
+        result = await session.execute(select(MenuItem).where(MenuItem.id == item_id))
+        item = result.scalar_one_or_none()
+        
+        if not item:
+            await message.answer("Позиция не найдена")
+            await state.clear()
+            return
+        
+        # Обновляем фото
+        item.photo = photo_id
+        await session.commit()
+        
+        await message.answer("✅ Фото успешно изменено")
+        
+        # Возвращаемся к управлению меню
+        await manage_menu_command(message, state)
+
+@router.message(EditMenuItem.waiting_for_duration)
+async def process_edit_duration(message: Message, state: FSMContext):
+    """Обработка ввода новой длительности"""
+    data = await state.get_data()
+    item_id = data.get("edit_item_id")
+    
+    if not message.text.isdigit() or int(message.text) <= 0:
+        await message.answer(
+            "Пожалуйста, введите положительное число (больше 0):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+            ])
+        )
+        return
+    
+    # Проверка на разумное значение (не больше 24 часов - 1440 минут)
+    duration = int(message.text)
+    if duration > 1440:
+        await message.answer(
+            "Длительность не может превышать 24 часа (1440 минут). Пожалуйста, введите меньшее значение:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+            ])
+        )
+        return
+    
+    async with async_session() as session:
+        # Получаем позицию по ID
+        result = await session.execute(select(MenuItem).where(MenuItem.id == item_id))
+        item = result.scalar_one_or_none()
+        
+        if not item:
+            await message.answer("Позиция не найдена")
+            await state.clear()
+            return
+        
+        # Обновляем длительность
+        item.duration = duration
+        await session.commit()
+        
+        await message.answer(f"✅ Длительность успешно изменена на {duration} мин")
+        
+        # Возвращаемся к управлению меню
+        await manage_menu_command(message, state)
+
+@router.callback_query(F.data.startswith("payment_type:"))
+async def process_payment_type(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора типа оплаты"""
+    payment_type = callback.data.split(":")[-1]
+    await state.update_data(payment_type=payment_type)
+    
+    if payment_type == "kisses":
+        await state.set_state(MenuItemForm.price_kisses)
+        await callback.message.answer(
+            "Введите количество поцелуйчиков (только число):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+            ])
+        )
+    elif payment_type == "hugs":
+        await state.set_state(MenuItemForm.price_hugs)
+        await callback.message.answer(
+            "Введите количество минут обнимашек (только число):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+            ])
+        )
+    else:  # both
+        await state.set_state(MenuItemForm.price_kisses)
+        await callback.message.answer(
+            "Введите количество поцелуйчиков (только число):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+            ])
+        )
+    
+    await callback.answer()
+
+@router.message(MenuItemForm.price_kisses)
+async def process_price_kisses(message: Message, state: FSMContext):
+    """Обработка ввода количества поцелуйчиков"""
+    if not message.text.isdigit() or int(message.text) < 0:
+        await message.answer(
+            "Пожалуйста, введите неотрицательное число:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+            ])
+        )
+        return
+    
+    # Сохраняем количество поцелуйчиков в состоянии
+    await state.update_data(price_kisses=int(message.text))
+    
+    # Проверяем, выбран ли тип оплаты "оба варианта"
+    data = await state.get_data()
+    if data.get("payment_type") == "both":
+        # Если да, то переходим к вводу минут обнимашек
+        await state.set_state(MenuItemForm.price_hugs)
+        await message.answer(
+            "Теперь введите стоимость в минутах обнимашек:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+            ])
+        )
+    else:
+        # Иначе переходим сразу к созданию позиции
+        await create_menu_item(message, state)
+
+@router.message(MenuItemForm.price_hugs)
+async def process_price_hugs(message: Message, state: FSMContext):
+    """Обработка ввода стоимости в минутах обнимашек"""
+    if not message.text.isdigit() or int(message.text) < 0:
+        await message.answer(
+            "Пожалуйста, введите неотрицательное число:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+            ])
+        )
+        return
+    
+    # Сохраняем стоимость в минутах обнимашек
+    await state.update_data(price_hugs=int(message.text))
+    
+    # Создаем позицию меню
+    await create_menu_item(message, state)
+
+@router.callback_query(F.data == "cancel")
+async def cancel_operation(callback: CallbackQuery, state: FSMContext):
+    """Отмена текущей операции"""
+    await state.clear()
+    await callback.message.answer("Операция отменена")
+    
+    # Возвращаемся к управлению рестораном
+    async with async_session() as session:
+        result = await session.execute(select(User).where(User.telegram_id == callback.from_user.id))
+        user = result.scalar_one_or_none()
+        
+        if user and user.is_restaurant_owner:
+            await callback.message.answer(
+                "Вы вернулись в управление рестораном. Выберите действие:",
+                reply_markup=get_restaurant_admin_kb()
+            )
+    
+    await callback.answer()
+
+async def create_menu_item(message: Message, state: FSMContext):
+    """Создание новой позиции в меню после сбора всех данных"""
+    data = await state.get_data()
+    
+    async with async_session() as session:
+        # Получаем пользователя
+        result = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
+        user = result.scalar_one_or_none()
+        
+        if not user:
+            await message.answer("Произошла ошибка при получении данных пользователя.")
+            await state.clear()
+            return
+        
+        # Получаем ресторан пользователя
+        result = await session.execute(select(Restaurant).where(Restaurant.owner_id == user.id))
+        restaurant = result.scalar_one_or_none()
+        
+        if not restaurant:
+            await message.answer("Ресторан не найден.")
+            await state.clear()
+            return
+        
+        # Создаем новую позицию меню
+        menu_item = MenuItem(
+            restaurant_id=restaurant.id,
+            name=data.get("name"),
+            photo=data.get("photo_id"),  # Обратите внимание на изменение с photo на photo_id
+            description=data.get("description"),
+            duration=data.get("duration")
+        )
+        
+        # Устанавливаем цены в зависимости от типа оплаты
+        menu_item.price_kisses = data.get("price_kisses")
+        menu_item.price_hugs = data.get("price_hugs")
+        
+        session.add(menu_item)
+        await session.commit()
+    
+    # Очищаем состояние и отправляем сообщение об успехе
+    await state.clear()
+    await message.answer(f"✅ Позиция '{data.get('name')}' успешно добавлена в меню!")
+    
+    # Возвращаемся к управлению меню
+    await manage_menu_command(message, state)
+
+@router.callback_query(F.data == "restaurant_settings")
+async def restaurant_settings(callback: CallbackQuery):
+    """Настройки ресторана"""
+    await callback.answer()
+    
+    async with async_session() as session:
+        # Получаем пользователя
+        result = await session.execute(select(User).where(User.telegram_id == callback.from_user.id))
+        user = result.scalar_one_or_none()
+        
+        if not user or not user.is_restaurant_owner:
+            await callback.message.answer("У вас нет ресторана!")
+            return
+        
+        # Получаем ресторан пользователя
+        result = await session.execute(select(Restaurant).where(Restaurant.owner_id == user.id))
+        restaurant = result.scalar_one_or_none()
+        
+        if not restaurant:
+            await callback.message.answer("Ресторан не найден. Попробуйте создать новый.")
+            return
+        
+        # Создаем клавиатуру с настройками
+        kb = [
+            [InlineKeyboardButton(text="✏️ Изменить название", callback_data="edit_restaurant_name")],
+            [InlineKeyboardButton(text="🔄 Сгенерировать новый код приглашения", callback_data="regenerate_invite_code")],
+            [InlineKeyboardButton(text="🗑️ Удалить ресторан", callback_data="delete_restaurant")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_restaurant")]
+        ]
+        
+        await callback.message.edit_text(
+            f"⚙️ Настройки ресторана '{restaurant.name}':\n\n"
+            f"Текущее название: {restaurant.name}\n"
+            f"🔑 Код приглашения: {restaurant.invite_code}\n"
+            f"🔗 Ссылка для приглашения: t.me/{(await callback.bot.me()).username}?start={restaurant.invite_code}\n\n"
+            f"Выберите действие:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+        )
+
+@router.callback_query(F.data == "edit_restaurant_name")
+async def edit_restaurant_name(callback: CallbackQuery, state: FSMContext):
+    """Изменение названия ресторана"""
+    await callback.answer()
+    
+    # Получаем ресторан пользователя
+    async with async_session() as session:
+        result = await session.execute(
+            select(Restaurant).join(User, Restaurant.owner_id == User.id)
+            .where(User.telegram_id == callback.from_user.id)
+        )
+        restaurant = result.scalar_one_or_none()
+        
+        if not restaurant:
+            await callback.message.answer("Ресторан не найден.")
+            return
+        
+        await state.set_state(RestaurantSettings.waiting_for_new_name)
+        await callback.message.answer(
+            f"Текущее название ресторана: {restaurant.name}\n\n"
+            f"Введите новое название для вашего ресторана:"
+        )
+
+@router.message(RestaurantSettings.waiting_for_new_name)
+async def process_new_restaurant_name(message: Message, state: FSMContext):
+    """Обработка нового названия ресторана"""
+    new_name = message.text.strip()
+    
+    if not new_name:
+        await message.answer("Название не может быть пустым. Пожалуйста, введите корректное название.")
+        return
+        
+    async with async_session() as session:
+        # Получаем ресторан пользователя
+        result = await session.execute(
+            select(Restaurant).join(User, Restaurant.owner_id == User.id)
+            .where(User.telegram_id == message.from_user.id)
+        )
+        restaurant = result.scalar_one_or_none()
+        
+        if not restaurant:
+            await message.answer("Ресторан не найден.")
+            await state.clear()
+            return
+        
+        # Сохраняем старое название для уведомления клиентов
+        old_name = restaurant.name
+        
+        # Обновляем название
+        restaurant.name = new_name
+        await session.commit()
+        
+        # Получаем список подключенных пользователей для уведомления
+        result = await session.execute(
+            select(User).where(User.current_restaurant_id == restaurant.id)
+        )
+        connected_users = result.scalars().all()
+        
+        # Уведомляем подключенных пользователей об изменении названия
+        bot = message.bot
+        for user in connected_users:
+            try:
+                await bot.send_message(
+                    user.telegram_id,
+                    f"🔔 Уведомление: ресторан '{old_name}' изменил название на '{new_name}'."
+                )
+            except Exception as e:
+                logging.error(f"Failed to notify user {user.telegram_id} about restaurant name change: {e}")
+        
+        await state.clear()
+        await message.answer(
+            f"✅ Название ресторана успешно изменено на '{new_name}'!\n"
+            f"Все подключенные клиенты ({len(connected_users)}) были уведомлены об изменении."
+        )
+        
+        # Показываем меню управления рестораном
+        await message.answer(
+            f"🍴 Ваш ресторан: {new_name}\n\n"
+            f"🔑 Код приглашения: {restaurant.invite_code}\n"
+            f"🔗 Ссылка для приглашения: t.me/{(await bot.me()).username}?start={restaurant.invite_code}\n\n"
+            f"Выберите действие:",
+            reply_markup=get_restaurant_admin_kb()
+        )
+
+@router.callback_query(F.data == "regenerate_invite_code")
+async def regenerate_invite_code(callback: CallbackQuery):
+    """Генерация нового кода приглашения"""
+    await callback.answer()
+    
+    async with async_session() as session:
+        # Получаем ресторан пользователя
+        result = await session.execute(
+            select(Restaurant).join(User, Restaurant.owner_id == User.id)
+            .where(User.telegram_id == callback.from_user.id)
+        )
+        restaurant = result.scalar_one_or_none()
+        
+        if not restaurant:
+            await callback.message.answer("Ресторан не найден.")
+            return
+        
+        # Генерируем новый код
+        new_code = await generate_unique_invite_code(session)
+        
+        # Обновляем код приглашения
+        restaurant.invite_code = new_code
+        await session.commit()
+        
+        await callback.message.edit_text(
+            f"✅ Новый код приглашения сгенерирован!\n\n"
+            f"🍴 Ресторан: {restaurant.name}\n"
+            f"🔑 Новый код: {new_code}\n"
+            f"🔗 Ссылка для приглашения: t.me/{(await callback.bot.me()).username}?start={new_code}\n\n"
+            f"⚠️ Старый код больше не работает!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад к настройкам", callback_data="restaurant_settings")]
+            ])
+        )
+
+@router.callback_query(F.data == "manage_clients")
+async def manage_clients(callback: CallbackQuery, state: FSMContext):
+    """Управление клиентами ресторана"""
+    await callback.answer()
+    
+    # Получаем страницу из состояния или начинаем с 1
+    data = await state.get_data()
+    page = data.get("clients_page", 1)
+    
+    clients_per_page = 5
+    offset = (page - 1) * clients_per_page
+    
+    async with async_session() as session:
+        # Получаем ресторан пользователя
+        result = await session.execute(
+            select(Restaurant).join(User, Restaurant.owner_id == User.id)
+            .where(User.telegram_id == callback.from_user.id)
+        )
+        restaurant = result.scalar_one_or_none()
+        
+        if not restaurant:
+            await callback.message.answer("Ресторан не найден.")
+            return
+        
+        # Получаем общее количество подключенных клиентов
+        count_query = select(func.count()).select_from(User).where(User.current_restaurant_id == restaurant.id)
+        total_clients = await session.scalar(count_query) or 0
+        
+        if total_clients == 0:
+            await callback.message.edit_text(
+                f"👥 К вашему ресторану '{restaurant.name}' пока никто не подключен.\n\n"
+                f"🔑 Клиенты могут подключиться по коду: {restaurant.invite_code}\n"
+                f"🔗 Или по ссылке: t.me/{(await callback.bot.me()).username}?start={restaurant.invite_code}",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_restaurant")]
+                ])
+            )
+            return
+        
+        # Получаем список клиентов с пагинацией
+        clients_query = select(User).where(User.current_restaurant_id == restaurant.id).limit(clients_per_page).offset(offset)
+        result = await session.execute(clients_query)
+        clients = result.scalars().all()
+        
+        # Общее количество страниц
+        total_pages = (total_clients + clients_per_page - 1) // clients_per_page
+        
+        # Формируем текст со списком клиентов
+        text = f"👥 Клиенты ресторана '{restaurant.name}' (страница {page} из {total_pages}):\n\n"
+        
+        for i, client in enumerate(clients, offset + 1):
+            # Добавляем информацию о клиенте
+            last_activity = client.last_activity.strftime("%d.%m.%Y %H:%M") if client.last_activity else "неизвестно"
+            joined_at = client.created_at.strftime("%d.%m.%Y") if client.created_at else "неизвестно"
+            
+            # Получаем информацию о пользователе из Telegram
+            try:
+                user_info = await callback.bot.get_chat(client.telegram_id)
+                username = user_info.username or "Нет username"
+                fullname = user_info.full_name or "Без имени"
+                user_display = f"{fullname}" + (f" (@{username})" if username != "Нет username" else "")
+            except Exception as e:
+                logging.error(f"Failed to get user info: {e}")
+                user_display = f"ID: {client.telegram_id}"
+            
+            text += (
+                f"{i}. {user_display}\n"
+                f"   ID: {client.telegram_id}\n"
+                f"   Последняя активность: {last_activity}\n"
+                f"   Регистрация: {joined_at}\n\n"
+            )
+        
+        # Создаем кнопки пагинации и управления
+        kb = []
+        
+        # Кнопки действий
+        action_buttons = []
+        if page > 1:
+            action_buttons.append(InlineKeyboardButton(text="◀️ Назад", callback_data="clients_prev_page"))
+        
+        if page < total_pages:
+            action_buttons.append(InlineKeyboardButton(text="Вперед ▶️", callback_data="clients_next_page"))
+        
+        if action_buttons:
+            kb.append(action_buttons)
+        
+        # Кнопка удаления клиентов
+        if clients:
+            kb.append([InlineKeyboardButton(text="❌ Удалить клиента", callback_data="select_client_to_remove")])
+        
+        kb.append([InlineKeyboardButton(text="⬅️ Назад к ресторану", callback_data="back_to_restaurant")])
+        
+        # Сохраняем текущую страницу в состоянии
+        await state.update_data(clients_page=page)
+        
+        # Отправляем список клиентов
+        await callback.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+        )
+
+@router.callback_query(F.data == "clients_prev_page")
+async def clients_prev_page(callback: CallbackQuery, state: FSMContext):
+    """Предыдущая страница списка клиентов"""
+    await callback.answer()
+    
+    data = await state.get_data()
+    current_page = data.get("clients_page", 1)
+    
+    if current_page > 1:
+        await state.update_data(clients_page=current_page - 1)
+    
+    await manage_clients(callback, state)
+
+@router.callback_query(F.data == "clients_next_page")
+async def clients_next_page(callback: CallbackQuery, state: FSMContext):
+    """Следующая страница списка клиентов"""
+    await callback.answer()
+    
+    data = await state.get_data()
+    current_page = data.get("clients_page", 1)
+    
+    async with async_session() as session:
+        # Получаем ресторан пользователя
+        result = await session.execute(
+            select(Restaurant).join(User, Restaurant.owner_id == User.id)
+            .where(User.telegram_id == callback.from_user.id)
+        )
+        restaurant = result.scalar_one_or_none()
+        
+        if not restaurant:
+            return
+        
+        # Получаем общее количество клиентов
+        count_query = select(func.count()).select_from(User).where(User.current_restaurant_id == restaurant.id)
+        total_clients = await session.scalar(count_query) or 0
+        
+        clients_per_page = 5
+        total_pages = (total_clients + clients_per_page - 1) // clients_per_page
+        
+        if current_page < total_pages:
+            await state.update_data(clients_page=current_page + 1)
+    
+    await manage_clients(callback, state)
+
+@router.callback_query(F.data == "select_client_to_remove")
+async def select_client_to_remove(callback: CallbackQuery, state: FSMContext):
+    """Выбор клиента для удаления"""
+    await callback.answer()
+    
+    async with async_session() as session:
+        # Получаем ресторан пользователя
+        result = await session.execute(
+            select(Restaurant).join(User, Restaurant.owner_id == User.id)
+            .where(User.telegram_id == callback.from_user.id)
+        )
+        restaurant = result.scalar_one_or_none()
+        
+        if not restaurant:
+            await callback.message.answer("Ресторан не найден.")
+            return
+        
+        # Получаем список клиентов
+        result = await session.execute(
+            select(User).where(User.current_restaurant_id == restaurant.id)
+        )
+        clients = result.scalars().all()
+        
+        if not clients:
+            await callback.message.edit_text(
+                "К вашему ресторану никто не подключен.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="manage_clients")]
+                ])
+            )
+            return
+        
+        # Создаем клавиатуру с кнопками для каждого клиента
+        kb = []
+        for client in clients:
+            # Получаем информацию о пользователе из Telegram
+            try:
+                user_info = await callback.bot.get_chat(client.telegram_id)
+                username = user_info.username or "Нет username"
+                fullname = user_info.full_name or "Без имени"
+                user_display = f"{fullname}" + (f" (@{username})" if username != "Нет username" else "")
+            except Exception as e:
+                logging.error(f"Failed to get user info: {e}")
+                user_display = f"ID: {client.telegram_id}"
+            
+            kb.append([
+                InlineKeyboardButton(
+                    text=f"{user_display}",
+                    callback_data=f"remove_client:{client.telegram_id}"
+                )
+            ])
+        
+        kb.append([InlineKeyboardButton(text="❌ Отмена", callback_data="manage_clients")])
+        
+        await callback.message.edit_text(
+            "Выберите клиента для удаления из ресторана:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+        )
+
+@router.callback_query(F.data.startswith("remove_client:"))
+async def remove_client(callback: CallbackQuery, state: FSMContext):
+    """Удаление клиента из ресторана"""
+    client_id = int(callback.data.split(":")[-1])
+    
+    async with async_session() as session:
+        # Получаем ресторан владельца
+        result = await session.execute(
+            select(Restaurant).join(User, Restaurant.owner_id == User.id)
+            .where(User.telegram_id == callback.from_user.id)
+        )
+        restaurant = result.scalar_one_or_none()
+        
+        if not restaurant:
+            await callback.answer("Ресторан не найден!")
+            return
+        
+        # Получаем клиента
+        result = await session.execute(
+            select(User).where(
+                and_(
+                    User.telegram_id == client_id,
+                    User.current_restaurant_id == restaurant.id
+                )
+            )
+        )
+        client = result.scalar_one_or_none()
+        
+        if not client:
+            await callback.answer("Клиент не найден или не подключен к вашему ресторану!")
+            return
+        
+        # Отключаем клиента от ресторана
+        client.current_restaurant_id = None
+        client.last_activity = datetime.now()
+        await session.commit()
+        
+        # Уведомляем клиента
+        try:
+            await callback.bot.send_message(
+                client_id,
+                f"❌ Вы были отключены от ресторана '{restaurant.name}' его владельцем."
+            )
+        except Exception as e:
+            logging.error(f"Failed to notify client {client_id} about removal: {e}")
+        
+        await callback.answer(f"Клиент с ID {client_id} успешно удален из ресторана!")
+        
+        # Возвращаемся к управлению клиентами с явной передачей state
+        await manage_clients(callback, state)
+
+@router.message(EditMenuItem.waiting_for_price_kisses)
+async def process_edit_price_kisses(message: Message, state: FSMContext):
+    """Обработка ввода новой цены в поцелуйчиках"""
+    data = await state.get_data()
+    item_id = data.get("edit_item_id")
+    
+    if not message.text.isdigit() or int(message.text) < 0:
+        await message.answer(
+            "Пожалуйста, введите неотрицательное число:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+            ])
+        )
+        return
+    
+    price = int(message.text)
+    
+    async with async_session() as session:
+        # Получаем позицию по ID
+        result = await session.execute(select(MenuItem).where(MenuItem.id == item_id))
+        item = result.scalar_one_or_none()
+        
+        if not item:
+            await message.answer("Позиция не найдена")
+            await state.clear()
+            return
+        
+        # Обновляем цену
+        item.price_kisses = price
+        await session.commit()
+        
+        await message.answer(f"✅ Стоимость в поцелуйчиках успешно изменена на {price}")
+        
+        # Возвращаемся к управлению меню
+        await manage_menu_command(message, state)
+
+@router.message(EditMenuItem.waiting_for_price_hugs)
+async def process_edit_price_hugs(message: Message, state: FSMContext):
+    """Обработка ввода новой цены в минутах обнимашек"""
+    data = await state.get_data()
+    item_id = data.get("edit_item_id")
+    
+    if not message.text.isdigit() or int(message.text) < 0:
+        await message.answer(
+            "Пожалуйста, введите неотрицательное число:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+            ])
+        )
+        return
+    
+    price = int(message.text)
+    
+    async with async_session() as session:
+        # Получаем позицию по ID
+        result = await session.execute(select(MenuItem).where(MenuItem.id == item_id))
+        item = result.scalar_one_or_none()
+        
+        if not item:
+            await message.answer("Позиция не найдена")
+            await state.clear()
+            return
+        
+        # Обновляем цену
+        item.price_hugs = price
+        await session.commit()
+        
+        await message.answer(f"✅ Стоимость в минутах обнимашек успешно изменена на {price}")
+        
+        # Возвращаемся к управлению меню
+        await manage_menu_command(message, state)
+
+@router.message(MenuItemForm.duration)
+async def process_menu_item_duration(message: Message, state: FSMContext):
+    """Обработка ввода длительности позиции меню"""
+    if not message.text.isdigit() or int(message.text) <= 0:
+        await message.answer(
+            "Пожалуйста, введите положительное число (больше 0):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+            ])
+        )
+        return
+    
+    # Проверка на разумное значение (не больше 24 часов - 1440 минут)
+    duration = int(message.text)
+    if duration > 1440:
+        await message.answer(
+            "Длительность не может превышать 24 часа (1440 минут). Пожалуйста, введите меньшее значение:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+            ])
+        )
+        return
+    
+    # Сохраняем длительность в состоянии
+    await state.update_data(duration=duration)
+    
+    # Переходим к следующему шагу - выбору типа оплаты
+    await state.set_state(MenuItemForm.payment_type)
+    await message.answer(
+        "Выберите тип оплаты:",
+        reply_markup=get_payment_type_kb()
+    )
+
+@router.callback_query(F.data == "delete_restaurant")
+async def delete_restaurant_confirmation(callback: CallbackQuery, state: FSMContext):
+    """Запрос подтверждения на удаление ресторана"""
+    await callback.answer()
+    
+    # Устанавливаем состояние подтверждения удаления
+    await state.set_state(RestaurantSettings.confirm_delete_restaurant)
+    
+    kb = [
+        [
+            InlineKeyboardButton(text="✅ Да, удалить", callback_data="confirm_delete_restaurant"),
+            InlineKeyboardButton(text="❌ Нет, отменить", callback_data="restaurant_settings")
+        ]
+    ]
+    
+    await callback.message.edit_text(
+        "⚠️ Вы действительно хотите удалить ваш ресторан?\n\n"
+        "Это действие нельзя отменить. Все данные ресторана будут удалены, "
+        "включая меню и подключенных клиентов.\n\n"
+        "Все клиенты получат уведомление об удалении ресторана.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
+
+@router.callback_query(F.data == "confirm_delete_restaurant")
+async def process_delete_restaurant(callback: CallbackQuery, state: FSMContext):
+    """Обработчик удаления ресторана"""
+    await callback.answer("Удаляем ресторан...")
+    
+    async with async_session() as session:
+        # Получаем пользователя
+        result = await session.execute(select(User).where(User.telegram_id == callback.from_user.id))
+        user = result.scalar_one_or_none()
+        
+        if not user or not user.is_restaurant_owner:
+            await callback.message.answer("У вас нет ресторана!")
+            await state.clear()
+            return
+        
+        # Получаем ресторан пользователя
+        result = await session.execute(select(Restaurant).where(Restaurant.owner_id == user.id))
+        restaurant = result.scalar_one_or_none()
+        
+        if not restaurant:
+            await callback.message.answer("Ресторан не найден.")
+            await state.clear()
+            return
+        
+        # Получаем список подключенных клиентов для уведомления
+        result = await session.execute(
+            select(User).where(User.current_restaurant_id == restaurant.id)
+        )
+        connected_users = result.scalars().all()
+        
+        # Сохраняем название для уведомления
+        restaurant_name = restaurant.name
+        
+        # Отвязываем всех подключенных пользователей
+        for client in connected_users:
+            client.current_restaurant_id = None
+        
+        # Удаляем ресторан
+        await session.delete(restaurant)
+        
+        # Обновляем статус пользователя - теперь он не владелец ресторана
+        user.is_restaurant_owner = False
+        
+        # Применяем изменения
+        await session.commit()
+        
+        # Уведомляем клиентов об удалении ресторана
+        bot = callback.bot
+        for client in connected_users:
+            try:
+                await bot.send_message(
+                    client.telegram_id,
+                    f"🚫 Уведомление: ресторан '{restaurant_name}' был удален его владельцем.\n"
+                    f"Вы были отключены от этого ресторана."
+                )
+            except Exception as e:
+                logging.error(f"Failed to notify user {client.telegram_id} about restaurant deletion: {e}")
+        
+        # Очищаем состояние
+        await state.clear()
+        
+        # Обновляем текст сообщения
+        await callback.message.edit_text(
+            f"✅ Ресторан '{restaurant_name}' успешно удален!\n"
+            f"Все клиенты ({len(connected_users)}) были уведомлены."
+        )
+        
+        # Показываем основное меню с обновленной клавиатурой
+        await callback.message.answer(
+            "Вы вернулись в главное меню.",
+            reply_markup=get_main_menu(user)
+        )
