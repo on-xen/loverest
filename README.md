@@ -46,8 +46,9 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
 ## Команды бота
 
 - `/start` - Начать работу с ботом
-- `/paysupport` - Информация о возврате средств
+- `/paysuppot` - Информация о возврате средств
 - `/donate` - Быстрое пожертвование
+- `/help` - Помощь
 
 ## Технологии
 
