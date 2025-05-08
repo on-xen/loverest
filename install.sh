@@ -58,8 +58,15 @@ if ! command -v docker &> /dev/null; then
     exit 1
 fi
 
-# Check if Docker Compose is installed
-if ! command -v docker-compose &> /dev/null; then
+# Check if Docker Compose is installed (checking both old and new versions)
+docker_compose_installed=false
+if command -v docker-compose &> /dev/null; then
+    docker_compose_installed=true
+elif docker compose version &> /dev/null; then
+    docker_compose_installed=true
+fi
+
+if [ "$docker_compose_installed" = false ]; then
     echo -e "${YELLOW}Docker Compose is not installed on this system.${NC}"
     echo "Please install Docker Compose before continuing."
     echo "Visit https://docs.docker.com/compose/install/ for installation instructions."
@@ -67,11 +74,17 @@ if ! command -v docker-compose &> /dev/null; then
 fi
 
 echo -e "${GREEN}Starting Docker containers...${NC}"
-docker-compose down
-docker-compose up -d
+# Try with new docker compose syntax first, if fails, use old syntax
+if docker compose version &> /dev/null; then
+    docker compose down
+    docker compose up -d
+else
+    docker-compose down
+    docker-compose up -d
+fi
 
 echo -e "${GREEN}Installation complete!${NC}"
 echo "The Love Restaurant Bot is now running!"
 echo ""
-echo "You can check the logs with: docker-compose logs -f"
-echo "To stop the bot: docker-compose down" 
+echo "You can check the logs with: docker compose logs -f"
+echo "To stop the bot: docker compose down" 
