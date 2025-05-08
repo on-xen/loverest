@@ -22,8 +22,8 @@ Telegram бот для создания виртуальных ресторан�
 
 1. Клонируйте репозиторий:
 ```bash
-git clone https://github.com/yourusername/love-restaurant-bot.git
-cd love-restaurant-bot
+git clone https://github.com/on-xen/loverest.git
+cd loverest
 ```
 
 2. Запустите скрипт установки:
@@ -46,8 +46,9 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
 ## Команды бота
 
 - `/start` - Начать работу с ботом
-- `/paysupport` - Информация о возврате средств
+- `/paysuppot` - Информация о возврате средств
 - `/donate` - Быстрое пожертвование
+- `/help` - Помощь
 
 ## Технологии
 
